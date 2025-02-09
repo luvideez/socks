@@ -1,499 +1,551 @@
+#define UNICODE
+#define _UNICODE
+
 #include <iostream>
+#include <windows.h>
+#include <windowsx.h> // For SetWindowSubclass, DefSubclassProc
+#include <commdlg.h>
 #include <fstream>
 #include <string>
 #include <sstream>
-#include <vector>
-#include <chrono>
-#include <thread>
 #include <ctime>
 #include <iomanip>
-#include <windows.h>
-#include <shlobj.h>
-#include <tlhelp32.h>
-#include "resource.h" // Include file resource.h
+#include <thread>
+#include <chrono>
+#include <TlHelp32.h>
+#include <Wininet.h>
+#include <algorithm>
+#include <gdiplus.h>
+#include <Shellapi.h> // Required for ShellExecuteW
+#include "resource.h" // Required for resource definitions (IDI_ICON1)
+#pragma comment (lib,"Gdiplus.lib")
 
-// --- Cấu hình ---
-const std::wstring DEFAULT_TLP_FILENAME = L"C:\\Users\\Luvideez\\Desktop\\ditucogivui.tlp";
-const std::wstring BITVISE_EXECUTABLE_NAME = L"BvSsh.exe";
-const int PROXY_PORT = 9999;
+using namespace Gdiplus;
 
-bool timerRunning = false;
-std::chrono::time_point<std::chrono::system_clock> startTime;
-std::wstring tlpFilePath = DEFAULT_TLP_FILENAME;
+// Định nghĩa các ID cho menu và controls
+#define IDM_SETTING_FILE 1001
+#define IDM_SETTING_EXIT 1002
+#define IDM_ABOUT 1003
+#define IDB_VPN_ON 2001
+#define IDB_VPN_OFF 2002
+#define IDM_THEME_LIGHT 3001
+#define IDM_THEME_DARK 3002
 
-// --- Các biến toàn cục ---
-HWND hwndStatusLabel = nullptr;
-HWND hwndTimerLabel = nullptr;
-HWND hwndTlpFileLabel = nullptr;
-HWND hwndMainWindow = nullptr;
+// Các biến toàn cục
+HINSTANCE hInst;
+HWND hMainWnd;
+HWND hTimeLabel;
+HWND hVPNOnButton, hVPNOffButton;
+std::time_t startTime = 0;
+bool vpnEnabled = false;
+std::thread timerThread;
+HFONT hFont;
+std::wstring bvSshStatus;
+bool isDarkMode = false; // Track the theme
+bool buttonPressed = false; // Track the button state
 
-// --- Font chữ ---
-HFONT hFont = nullptr;
+// Các đường dẫn (sử dụng wstring)
+const std::wstring bitvisePath = L"C:\\Program Files (x86)\\Bitvise SSH Client\\BvSsh.exe";
+const std::wstring tlpFilePath = L"C:\\Users\\Luvideez\\Desktop\\ditucogivui.tlp";
+const std::wstring socksIP = L"127.0.0.1:9999";
 
-// --- Màu sắc ---
-HBRUSH hButtonBrush = nullptr;
-HBRUSH hStaticTextBrush = nullptr;
-HBRUSH hStaticTextBackgroundBrush = nullptr;
-COLORREF textColor = RGB(0, 0, 0);
+// Forward declarations (sử dụng wchar_t*)
+bool IsProcessRunning(const wchar_t* processName);
+void RunProcess(const std::wstring& filePath);
+void EnableSocksProxy(const std::wstring& proxyAddress);
+void DisableSocksProxy();
+void KillProcess(const wchar_t* processName);
+void UpdateTimerLabel();
+void UpdateBvSshStatus();
 
-// --- Khai báo WndProc ---
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+// Hàm cửa sổ chính
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
-// --- Các hàm hỗ trợ WinAPI ---
-void SetLabelText(HWND hwnd, const std::wstring& text) {
-    SetWindowTextW(hwnd, text.c_str());
-}
+// Hàm xử lý menu About
+void ShowAboutDialog(HWND hWnd);
 
-std::wstring GetLabelText(HWND hwnd) {
-    int len = GetWindowTextLengthW(hwnd);
-    if (len > 0) {
-        std::vector<wchar_t> buffer(len + 1);
-        GetWindowTextW(hwnd, buffer.data(), len + 1);
-        return std::wstring(buffer.data());
-    }
-    return L"";
-}
+// Hàm chọn file .tlp
+void ChooseTlpFile();
 
-void ShowMessageBox(const std::wstring& message, const std::wstring& title, UINT type = MB_OK | MB_ICONERROR) {
-    MessageBoxW(hwndMainWindow, message.c_str(), title.c_str(), type);
-}
+// Hàm cập nhật label thời gian
+void UpdateTimerLabel();
 
-bool CheckTlpFileExists() {
-    std::ifstream f(tlpFilePath);
-    return f.good();
-}
+// Hàm bật VPN
+void EnableVPN();
 
-bool SetProxySettings(bool enable) {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 0, KEY_WRITE, &hKey) != ERROR_SUCCESS) {
+// Hàm tắt VPN
+void DisableVPN();
+
+// Hàm kiểm tra tiến trình đang chạy
+bool IsProcessRunning(const wchar_t* processName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        // Xử lý lỗi nếu không thể tạo snapshot
+        MessageBoxW(NULL, L"Không thể tạo snapshot tiến trình.", L"Lỗi", MB_OK | MB_ICONERROR);
         return false;
     }
 
-    DWORD proxyEnable = enable ? 1 : 0;
-    if (RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&proxyEnable, sizeof(proxyEnable)) != ERROR_SUCCESS) {
-        RegCloseKey(hKey);
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (!Process32FirstW(hSnapshot, &pe32)) {
+        // Xử lý lỗi nếu không thể lấy tiến trình đầu tiên
+        MessageBoxW(NULL, L"Không thể lấy tiến trình đầu tiên.", L"Lỗi", MB_OK | MB_ICONERROR);
+        CloseHandle(hSnapshot);
         return false;
     }
 
-    if (enable) {
-        std::wstringstream proxyServerStream;
-        proxyServerStream << L"127.0.0.1:" << PROXY_PORT;
-        std::wstring proxyServer = proxyServerStream.str();
-        if (RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServer.c_str(), static_cast<DWORD>((proxyServer.size() + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) {
-            RegCloseKey(hKey);
-            return false;
+    do {
+        if (_wcsicmp(pe32.szExeFile, processName) == 0) {
+            // Tìm thấy tiến trình
+            CloseHandle(hSnapshot);
+            return true;
         }
+    } while (Process32NextW(hSnapshot, &pe32));
+
+    // Không tìm thấy tiến trình
+    CloseHandle(hSnapshot);
+    return false;
+}
+
+// Hàm chạy một tiến trình
+void RunProcess(const std::wstring& filePath) {
+    HINSTANCE hInst = ShellExecuteW(NULL, L"open", filePath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+
+    if ((INT_PTR)hInst <= 32) {
+        // Xử lý lỗi nếu ShellExecuteW thất bại
+        DWORD error = GetLastError();
+        std::wstringstream ss;
+        ss << L"Không thể mở file. Mã lỗi: " << error;
+        MessageBoxW(NULL, ss.str().c_str(), L"Lỗi", MB_OK | MB_ICONERROR);
+    }
+}
+
+// Hàm bật socks proxy (cần quyền admin)
+void EnableSocksProxy(const std::wstring& proxyAddress) {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+        DWORD proxyEnable = 1;
+        DWORD proxyOverride = 1; // Bypass proxy for local addresses
+        RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&proxyEnable, sizeof(proxyEnable));
+        RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (BYTE*)proxyAddress.c_str(), ((DWORD)proxyAddress.length() + 1) * sizeof(wchar_t)); // Multiply by sizeof(wchar_t) - Cast to DWORD
+        RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (BYTE*)L"<local>", 8 * sizeof(wchar_t));  // Bypass for local
+
+        RegCloseKey(hKey);
+
+        // Notify system of change
+        InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
+        InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
     }
     else {
+        MessageBoxW(NULL, L"Không thể bật Socks proxy. Vui lòng chạy với quyền Administrator.", L"Lỗi", MB_OK | MB_ICONERROR);
+    }
+}
+
+// Hàm tắt socks proxy (cần quyền admin)
+void DisableSocksProxy() {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS) {
+        DWORD proxyEnable = 0;
+        RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&proxyEnable, sizeof(proxyEnable));
         RegDeleteValueW(hKey, L"ProxyServer");
-    }
 
-    RegCloseKey(hKey);
-    return true;
+        RegCloseKey(hKey);
+
+        // Notify system of change
+        InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
+        InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
+
+    }
+    else {
+        MessageBoxW(NULL, L"Không thể tắt Socks proxy. Vui lòng chạy với quyền Administrator.", L"Lỗi", MB_OK | MB_ICONERROR);
+    }
 }
 
-bool RunTlpFile() {
-    SHELLEXECUTEINFOW ShExecInfo = { 0 };
-    ShExecInfo.cbSize = sizeof(SHELLEXECUTEINFOW);
-    ShExecInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
-    ShExecInfo.hwnd = NULL;
-    ShExecInfo.lpVerb = L"open";
-    ShExecInfo.lpFile = tlpFilePath.c_str();
-    ShExecInfo.lpParameters = NULL;
-    ShExecInfo.lpDirectory = NULL;
-    ShExecInfo.nShow = SW_SHOWNORMAL;
-    ShExecInfo.hInstApp = NULL;
-
-    if (!ShellExecuteExW(&ShExecInfo)) {
-        return false;
+// Hàm tắt một tiến trình
+void KillProcess(const wchar_t* processName) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        // Xử lý lỗi nếu không thể tạo snapshot
+        MessageBoxW(NULL, L"Không thể tạo snapshot tiến trình.", L"Lỗi", MB_OK | MB_ICONERROR);
+        return;
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    return true;
-}
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-bool KillBitviseProcess() {
-    HANDLE hSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapShot == INVALID_HANDLE_VALUE) {
-        return false;
+    if (!Process32FirstW(hSnapshot, &pe32)) {
+        // Xử lý lỗi nếu không thể lấy tiến trình đầu tiên
+        MessageBoxW(NULL, L"Không thể lấy tiến trình đầu tiên.", L"Lỗi", MB_OK | MB_ICONERROR);
+        CloseHandle(hSnapshot);
+        return;
     }
 
-    PROCESSENTRY32W pEntry;
-    pEntry.dwSize = sizeof(PROCESSENTRY32W);
-
-    if (!Process32FirstW(hSnapShot, &pEntry)) {
-        CloseHandle(hSnapShot);
-        return false;
-    }
-
-    bool killed = false;
     do {
-        if (BITVISE_EXECUTABLE_NAME == pEntry.szExeFile) {
-            HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pEntry.th32ProcessID);
-            if (hProcess != NULL) {
-                if (TerminateProcess(hProcess, 9)) {
-                    killed = true;
-                }
+        if (_wcsicmp(pe32.szExeFile, processName) == 0) {
+            HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+            if (hProcess) {
+                TerminateProcess(hProcess, 0);
                 CloseHandle(hProcess);
             }
+            else {
+                // Xử lý lỗi nếu không thể mở tiến trình
+                MessageBoxW(NULL, L"Không thể mở tiến trình để tắt.", L"Lỗi", MB_OK | MB_ICONERROR);
+            }
         }
-    } while (Process32NextW(hSnapShot, &pEntry));
+    } while (Process32NextW(hSnapshot, &pe32));
 
-    CloseHandle(hSnapShot);
-    return killed;
+    CloseHandle(hSnapshot);
 }
 
-void UpdateTimer() {
-    if (timerRunning) {
-        auto currentTime = std::chrono::system_clock::now();
-        std::chrono::duration<double> elapsedSeconds = currentTime - startTime;
-        std::time_t elapsed_time_t = static_cast<std::time_t>(elapsedSeconds.count());
-        std::tm elapsed_tm;
+// Hàm cập nhật label thời gian (chạy trong một thread riêng)
+void UpdateTimerLabel() {
+    while (vpnEnabled) {
+        std::time_t currentTime = std::time(nullptr);
+        std::time_t elapsedSeconds = currentTime - startTime;
 
-        if (gmtime_s(&elapsed_tm, &elapsed_time_t) != 0) {
-            SetLabelText(hwndTimerLabel, L"Lỗi cập nhật thời gian");
-            return;
-        }
+        int hours = (int)(elapsedSeconds / 3600);
+        int minutes = (int)((elapsedSeconds % 3600) / 60);
+        int seconds = (int)(elapsedSeconds % 60);
 
-        std::wstringstream timerStream;
-        timerStream << L"Thời gian hoạt động: " << std::put_time(&elapsed_tm, L"%H:%M:%S");
-        SetLabelText(hwndTimerLabel, timerStream.str());
-        SetTimer(hwndMainWindow, 1, 1000, (TIMERPROC)NULL);
+        std::wstringstream ss;
+        ss << L"Hoạt động: " << std::setw(2) << std::setfill(L'0') << hours << L":"
+            << std::setw(2) << std::setfill(L'0') << minutes << L":"
+            << std::setw(2) << std::setfill(L'0') << seconds;
+
+        std::wstring timeString = ss.str();
+        SetWindowTextW(hTimeLabel, timeString.c_str());
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+// Hàm cập nhật trạng thái BvSsh
+void UpdateBvSshStatus() {
+    if (IsProcessRunning(L"BvSsh.exe")) {
+        bvSshStatus = L"Bitvise SSH Client: Đang chạy";
     }
     else {
-        SetLabelText(hwndTimerLabel, L"Thời gian hoạt động: Đã tắt");
+        bvSshStatus = L"Bitvise SSH Client: Đang tắt";
     }
 }
 
-void BatSocksAction() {
-    if (timerRunning) {
-        ShowMessageBox(L"Socks đang hoạt động rồi!", L"Thông báo", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    SetLabelText(hwndStatusLabel, L"Đang bật Socks...");
-
-    if (!CheckTlpFileExists()) {
-        SetLabelText(hwndStatusLabel, L"Lỗi: Không tìm thấy file cấu hình TLP");
-        ShowMessageBox(L"Không tìm thấy file cấu hình TLP:\n" + tlpFilePath + L"\nVui lòng đảm bảo file này tồn tại hoặc chọn lại file.", L"Lỗi");
-        return;
-    }
-
-    SetLabelText(hwndStatusLabel, L"Đang chạy cấu hình VPN...");
-    if (!RunTlpFile()) {
-        SetLabelText(hwndStatusLabel, L"Lỗi chạy file TLP");
-        ShowMessageBox(L"Lỗi không xác định khi chạy file TLP.", L"Lỗi");
-        return;
-    }
-
-    SetLabelText(hwndStatusLabel, L"Đang thiết lập Proxy Server...");
-    if (!SetProxySettings(true)) {
-        SetLabelText(hwndStatusLabel, L"Lỗi bật Proxy");
-        ShowMessageBox(L"Lỗi khi bật Proxy Server.\nVui lòng kiểm tra quyền truy cập Registry.", L"Lỗi");
-        return;
-    }
-
-    startTime = std::chrono::system_clock::now();
-    timerRunning = true;
-    UpdateTimer();
-    SetLabelText(hwndStatusLabel, L"Socks đã bật và Proxy Server đã thiết lập. Đang hoạt động...");
-}
-
-void TatSocksAction() {
-    timerRunning = false;
-    SetLabelText(hwndStatusLabel, L"Đang tắt Socks...");
-    KillTimer(hwndMainWindow, 1);
-
-    SetLabelText(hwndStatusLabel, L"Đang tắt Proxy Server...");
-    bool proxySet = SetProxySettings(false);
-    if (!proxySet) {
-        SetLabelText(hwndStatusLabel, L"Lỗi tắt Proxy");
-        ShowMessageBox(L"Lỗi khi tắt Proxy Server.\nVui lòng kiểm tra quyền truy cập Registry.", L"Lỗi");
-        return;
-    }
-    SetLabelText(hwndStatusLabel, L"Proxy Server đã tắt.");
-
-    SetLabelText(hwndStatusLabel, L"Đang dừng Bitvise...");
-    bool bitviseKilled = KillBitviseProcess();
-    if (bitviseKilled) {
-        SetLabelText(hwndStatusLabel, L"Bitvise SSH Client đã dừng.");
+// Hàm bật VPN
+void EnableVPN() {
+    if (IsProcessRunning(L"BvSsh.exe")) {
+        MessageBoxW(NULL, L"Bitvise SSH Client đã chạy.", L"Thông báo", MB_OK | MB_ICONINFORMATION);
     }
     else {
-        SetLabelText(hwndStatusLabel, L"Lỗi dừng Bitvise");
-        ShowMessageBox(L"Lỗi khi dừng Bitvise SSH Client.", L"Lỗi");
+        // Chạy Bitvise SSH Client
+        RunProcess(tlpFilePath);
+
+        // Đợi 2 giây để Bitvise khởi động
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        // Bật Socks proxy
+        EnableSocksProxy(socksIP);
+
+        //MessageBoxW(NULL, L"VPN Enabled", L"Info", MB_OK | MB_ICONINFORMATION); // Removed message
     }
 
-    SetLabelText(hwndStatusLabel, L"Socks đã tắt và Proxy Server đã tắt. Ứng dụng sẽ đóng sau 2 giây...");
+    vpnEnabled = true;
+    startTime = std::time(nullptr);
+    timerThread = std::thread(UpdateTimerLabel);
+    timerThread.detach();
+    UpdateBvSshStatus();
+    InvalidateRect(hMainWnd, NULL, TRUE); // Force redraw to update status
+}
+
+// Hàm tắt VPN
+void DisableVPN() {
+    // Tắt Socks proxy
+    DisableSocksProxy();
+
+    // Tắt Bitvise SSH Client
+    KillProcess(L"BvSsh.exe");
+
+    // Đợi 2 giây
     std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Tắt chương trình (tự tắt)
     PostQuitMessage(0);
+    vpnEnabled = false;
+    UpdateBvSshStatus();
+    InvalidateRect(hMainWnd, NULL, TRUE); // Force redraw to update status
 }
 
-void ThoatAction() {
-    timerRunning = false;
-    KillTimer(hwndMainWindow, 1);
-    PostQuitMessage(0);
-}
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    hInst = hInstance;
 
-void ChooseTlpFileAction() {
-    OPENFILENAMEW ofn;
-    wchar_t szFile[260] = { 0 };
+    // Initialize GDI+
+    GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwndMainWindow;
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
-    ofn.lpstrFilter = L"TLP Files (*.tlp)\0*.tlp\0All Files (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.lpstrFileTitle = NULL;
-    ofn.nMaxFileTitle = 0;
-    ofn.lpstrInitialDir = NULL;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    // Đăng ký lớp cửa sổ
+    WNDCLASSEXW wcex;
+    wcex.cbSize = sizeof(WNDCLASSEXW);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = WndProc;
+    wcex.cbClsExtra = 0;
+    wcex.cbWndExtra = 0;
+    wcex.hInstance = hInstance;
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1)); // Set the icon
+    wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszMenuName = NULL;
+    wcex.lpszClassName = L"SocksVPNClass";
+    wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_ICON1)); // Set the small icon
 
-    if (GetOpenFileNameW(&ofn) == TRUE) {
-        tlpFilePath = ofn.lpstrFile;
-        std::wstring filename = tlpFilePath.substr(tlpFilePath.find_last_of(L"\\/") + 1);
-        SetLabelText(hwndTlpFileLabel, L"File TLP: " + filename);
-        std::wcout << L"Đã chọn file TLP: " << tlpFilePath << std::endl;
+    if (!RegisterClassExW(&wcex)) {
+        MessageBoxW(NULL, L"Call to RegisterClassEx failed!", L"Windows Desktop Guided Tour", NULL);
+        return 1;
     }
-}
 
-void ResizeControls(HWND hwndParent, int windowWidth, int windowHeight) {
-    // --- Định nghĩa padding và khoảng cách ---
-    int paddingX = 20; // Padding chiều ngang 20px
-    int paddingY = 10;
-    int controlHeight = 30;
-    int labelStaticHeight = 20;
+    // Tạo cửa sổ
+    hMainWnd = CreateWindowW(L"SocksVPNClass", L"Socks VPN", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 450, NULL, NULL, hInstance, NULL); // Reduced height by 30px
 
-    // --- Vị trí Y hiện tại để sắp xếp các control theo chiều dọc ---
-    int currentY = paddingY;
-
-    // --- Frame nội dung (Labels thông tin) ---
-    int labelWidth = windowWidth - 2 * paddingX; // Tính chiều rộng label dựa trên windowWidth và padding
-    MoveWindow(GetDlgItem(hwndParent, 104), paddingX, currentY, labelWidth, labelStaticHeight, TRUE);
-    currentY += labelStaticHeight + paddingY;
-    MoveWindow(GetDlgItem(hwndParent, 105), paddingX, currentY, labelWidth, labelStaticHeight, TRUE);
-    currentY += labelStaticHeight + paddingY;
-    MoveWindow(GetDlgItem(hwndParent, 106), paddingX, currentY, labelWidth, labelStaticHeight, TRUE);
-    currentY += labelStaticHeight + paddingY;
-    MoveWindow(GetDlgItem(hwndParent, 107), paddingX, currentY, labelWidth, labelStaticHeight, TRUE);
-    currentY += labelStaticHeight + paddingY;
-    MoveWindow(GetDlgItem(hwndParent, 108), paddingX, currentY, labelWidth, labelStaticHeight, TRUE);
-    currentY += labelStaticHeight + 2 * paddingY;
-
-    // --- Row chọn file TLP ---
-    int tlpFileRowWidth = windowWidth - 2 * paddingX; // Tính chiều rộng row file TLP dựa trên windowWidth và padding
-    int tlpFileLabelWidth = tlpFileRowWidth * 2 / 3;
-    int chooseTlpButtonWidth = tlpFileRowWidth / 3;
-
-    MoveWindow(hwndTlpFileLabel, paddingX, currentY, tlpFileLabelWidth, labelStaticHeight, TRUE);
-    MoveWindow(GetDlgItem(hwndParent, 103), paddingX + tlpFileLabelWidth + 5, currentY - 5, chooseTlpButtonWidth, controlHeight, TRUE);
-    currentY += labelStaticHeight + 2 * paddingY;
-
-    // --- Status Label ---
-    MoveWindow(hwndStatusLabel, paddingX, currentY, labelWidth, labelStaticHeight, TRUE); // Sử dụng labelWidth đã tính toán lại
-    currentY += labelStaticHeight + paddingY;
-
-    // --- Timer Label ---
-    MoveWindow(hwndTimerLabel, paddingX, currentY, labelWidth, labelStaticHeight, TRUE); // Sử dụng labelWidth đã tính toán lại
-    currentY += labelStaticHeight + 2 * paddingY;
-
-    // --- Button Row (Bật/Tắt/Thoát) ---
-    int buttonRowWidth = windowWidth - 2 * paddingX; // Tính chiều rộng row button dựa trên windowWidth và padding
-    int buttonWidth = (buttonRowWidth - 2 * 5) / 3; // Chia đều cho 3 nút
-
-    MoveWindow(GetDlgItem(hwndParent, 100), paddingX, currentY, buttonWidth, controlHeight, TRUE);
-    MoveWindow(GetDlgItem(hwndParent, 101), paddingX + buttonWidth + 5, currentY, buttonWidth, controlHeight, TRUE);
-    MoveWindow(GetDlgItem(hwndParent, 102), paddingX + 2 * (buttonWidth + 5), currentY, buttonWidth, controlHeight, TRUE);
-}
-
-BOOL InitInstance(HINSTANCE hInstance) {
-    const wchar_t CLASS_NAME[] = L"SocksVPNWindowClass";
-
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = CLASS_NAME;
-
-    RegisterClassW(&wc);
-
-    LOGFONTW lf;
-    GetObjectW(GetStockObject(DEFAULT_GUI_FONT), sizeof(LOGFONTW), &lf);
-    lf.lfHeight = -MulDiv(10, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72);
-    wcscpy_s(lf.lfFaceName, L"Arial");
-    hFont = CreateFontIndirectW(&lf);
-
-    // Màu nút bấm - Đã đổi sang màu xanh đậm
-    hButtonBrush = CreateSolidBrush(RGB(0, 0, 139)); // Màu xanh đậm cho nút bấm
-    hStaticTextBrush = CreateSolidBrush(textColor);
-    hStaticTextBackgroundBrush = CreateSolidBrush(RGB(255, 255, 255)); // Màu trắng cho nền label
-
-    int windowWidth = 450;
-    int windowHeight = 350 + 20; // Tăng chiều cao cửa sổ thêm 20px, thành 370px
-
-    hwndMainWindow = CreateWindowExW(
-        0,
-        CLASS_NAME,
-        L"Bật VPN - Socks",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, windowWidth, windowHeight,
-        NULL,
-        NULL,
-        hInstance,
-        NULL);
-
-    if (hwndMainWindow == NULL) {
-        return FALSE;
+    if (!hMainWnd) {
+        MessageBoxW(NULL, L"Call to CreateWindow failed!", L"Windows Desktop Guided Tour", NULL);
+        return 1;
     }
-    return TRUE;
+
+    // Tạo menu
+    HMENU hMenu = CreateMenu();
+    HMENU hSettingMenu = CreateMenu();
+
+    AppendMenuW(hSettingMenu, MF_STRING, IDM_THEME_LIGHT, L"Giao diện sáng");
+    AppendMenuW(hSettingMenu, MF_STRING, IDM_THEME_DARK, L"Giao diện tối");
+    AppendMenuW(hSettingMenu, MF_STRING, IDM_SETTING_FILE, L"Chọn file .tlp");
+    AppendMenuW(hSettingMenu, MF_STRING, IDM_SETTING_EXIT, L"Thoát");
+
+    AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hSettingMenu, L"Cài đặt"); // Vietnamese
+    AppendMenuW(hMenu, MF_STRING, IDM_ABOUT, L"Thông tin"); // Vietnamese
+
+    SetMenu(hMainWnd, hMenu);
+
+    // Tạo font Arial 20 đậm
+    hFont = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FF_DONTCARE, L"Arial");
+
+    // Tạo các controls
+    hTimeLabel = CreateWindowW(L"STATIC", L"Hoạt động: 00:00:00", WS_CHILD | WS_VISIBLE | SS_CENTER,
+        50, 200, 300, 20, hMainWnd, NULL, hInstance, NULL);
+    SendMessage(hTimeLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    hVPNOnButton = CreateWindowW(L"BUTTON", L"Bật VPN", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
+        50, 270, 100, 30, hMainWnd, (HMENU)IDB_VPN_ON, hInstance, NULL); //10px down
+    SendMessage(hVPNOnButton, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    hVPNOffButton = CreateWindowW(L"BUTTON", L"Tắt VPN", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON | BS_OWNERDRAW,
+        250, 270, 100, 30, hMainWnd, (HMENU)IDB_VPN_OFF, hInstance, NULL);//10px down
+    SendMessage(hVPNOffButton, WM_SETFONT, (WPARAM)hFont, TRUE);
+    // Make sure to set the Ownerdraw style for the Buttons! BS_OWNERDRAW style
+
+    // Initial BvSsh status update
+    UpdateBvSshStatus();
+
+    // Hiển thị cửa sổ
+    ShowWindow(hMainWnd, nCmdShow);
+    UpdateWindow(hMainWnd);
+
+    // Vòng lặp thông điệp
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    DeleteObject(hFont);
+    GdiplusShutdown(gdiplusToken);
+
+    return (int)msg.wParam;
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE: {
-        HWND softwareLabel = CreateWindowW(L"STATIC", L"Phần mềm bật/tắt Socks VPN", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 10, 330, 20, hwnd, (HMENU)104, GetModuleHandle(NULL), NULL);
-        SendMessageW(softwareLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND authorLabel = CreateWindowW(L"STATIC", L"Viết bởi: Luvideez", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 35, 330, 20, hwnd, (HMENU)105, GetModuleHandle(NULL), NULL);
-        SendMessageW(authorLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND serverLabel = CreateWindowW(L"STATIC", L"Server: ditucogivui.com", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 60, 330, 20, hwnd, (HMENU)106, GetModuleHandle(NULL), NULL);
-        SendMessageW(serverLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND tiktokLabel = CreateWindowW(L"STATIC", L"Tiktok: @ditucogivui", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 85, 330, 20, hwnd, (HMENU)107, GetModuleHandle(NULL), NULL);
-        SendMessageW(tiktokLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND emailLabel = CreateWindowW(L"STATIC", L"Email: luvideez@outlook.com", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 110, 330, 20, hwnd, (HMENU)108, GetModuleHandle(NULL), NULL);
-        SendMessageW(emailLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+// Hàm xử lý thông điệp cửa sổ
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    HDC hdc;
+    PAINTSTRUCT ps;
+    RECT rect = { 0 }; // Initialize rect here
+    HBRUSH hBrush;
+    COLORREF textColor = RGB(0, 0, 0);  // Default text color (black)
+    COLORREF bgColor = RGB(173, 216, 230);  // Default background color (light blue)
 
-        hwndTlpFileLabel = CreateWindowW(L"STATIC", (L"File TLP: " + DEFAULT_TLP_FILENAME.substr(DEFAULT_TLP_FILENAME.find_last_of(L"\\/") + 1)).c_str(),
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            10, 145, 200, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        SendMessageW(hwndTlpFileLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND chooseTlpButton = CreateWindowW(L"BUTTON", L"Chọn File TLP", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            220, 140, 120, 30, hwnd, (HMENU)103, GetModuleHandle(NULL), NULL);
-        SendMessageW(chooseTlpButton, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        hwndStatusLabel = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 180, 330, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        SendMessageW(hwndStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        hwndTimerLabel = CreateWindowW(L"STATIC", L"Thời gian hoạt động: Đã tắt", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            10, 210, 330, 20, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        SendMessageW(hwndTimerLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        HWND buttonBatSocks = CreateWindowW(L"BUTTON", L"Bật Socks", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            20, 250, 100, 30, hwnd, (HMENU)100, GetModuleHandle(NULL), NULL);
-        SendMessageW(buttonBatSocks, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND buttonTatSocks = CreateWindowW(L"BUTTON", L"Tắt Socks", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            130, 250, 100, 30, hwnd, (HMENU)101, GetModuleHandle(NULL), NULL);
-        SendMessageW(buttonTatSocks, WM_SETFONT, (WPARAM)hFont, TRUE);
-        HWND buttonThoat = CreateWindowW(L"BUTTON", L"Thoát", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            240, 250, 100, 30, hwnd, (HMENU)102, GetModuleHandle(NULL), NULL);
-        SendMessageW(buttonThoat, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-        // Load Icon từ resource và set cho cửa sổ
-        HICON hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCEW(IDI_ICON1));
-        if (hIcon) {
-            SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
-            SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
-        }
-
-        RECT rect;
-        GetClientRect(hwnd, &rect);
-        ResizeControls(hwnd, rect.right - rect.left, rect.bottom - rect.top);
-
-        break;
+    if (isDarkMode) {
+        textColor = RGB(255, 255, 255); // White
+        bgColor = RGB(0, 0, 0);   // Black
     }
-    case WM_COMMAND: {
-        if (LOWORD(wParam) == 100) {
-            BatSocksAction();
+    switch (message) {
+    case WM_LBUTTONDOWN:
+    {
+        // Kiểm tra xem chuột có nằm trên button không
+        POINT pt;
+        pt.x = LOWORD(lParam);
+        pt.y = HIWORD(lParam);
+
+        GetClientRect(hVPNOnButton, &rect); // Initialize rect for hit testing
+        if (PtInRect(&rect, pt))
+        {
+            buttonPressed = true;
+            InvalidateRect(hWnd, &rect, FALSE);
         }
-        else if (LOWORD(wParam) == 101) {
-            TatSocksAction();
-        }
-        else if (LOWORD(wParam) == 102) {
-            ThoatAction();
-        }
-        else if (LOWORD(wParam) == 103) {
-            ChooseTlpFileAction();
+        GetClientRect(hVPNOffButton, &rect); // Re-init for other Button
+        if (PtInRect(&rect, pt))
+        {
+            buttonPressed = true;
+            InvalidateRect(hWnd, &rect, FALSE);
         }
         break;
     }
-    case WM_TIMER: {
-        if (wParam == 1) {
-            UpdateTimer();
+
+    case WM_LBUTTONUP:
+    {
+        buttonPressed = false;
+        InvalidateRect(hWnd, &rect, FALSE);
+        break;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDM_SETTING_FILE:
+            ChooseTlpFile();
+            break;
+        case IDM_SETTING_EXIT:
+            DestroyWindow(hWnd);
+            break;
+        case IDM_ABOUT:
+            ShowAboutDialog(hWnd);
+            break;
+        case IDB_VPN_ON:
+            EnableVPN();
+            break;
+        case IDB_VPN_OFF:
+            DisableVPN();
+            break;
+            // Theme selection
+        case IDM_THEME_LIGHT:
+            isDarkMode = false;
+            InvalidateRect(hWnd, NULL, TRUE); // Redraw the window
+            break;
+        case IDM_THEME_DARK:
+            isDarkMode = true;
+            InvalidateRect(hWnd, NULL, TRUE); // Redraw the window
+            break;
         }
         break;
-    }
-    case WM_SIZE: {
-        int newWidth = LOWORD(lParam);
-        int newHeight = HIWORD(lParam);
-        ResizeControls(hwnd, newWidth, newHeight);
-        break;
-    }
     case WM_CTLCOLORSTATIC:
     {
         HDC hdcStatic = (HDC)wParam;
-        SetTextColor(hdcStatic, textColor);
-        SetBkColor(hdcStatic, RGB(255, 255, 255));
-        SetBkMode(hdcStatic, OPAQUE);
-        return (LRESULT)hStaticTextBackgroundBrush;
+        SetTextColor(hdcStatic, textColor); // Use theme text color
+        SetBkColor(hdcStatic, bgColor); // Use theme background color
+        return (INT_PTR)CreateSolidBrush(bgColor); // Use theme background color
     }
-    case WM_CTLCOLORBTN:
-    {
-        HDC hdcButton = (HDC)wParam;
-        SetBkColor(hdcButton, RGB(0, 0, 139)); // Màu xanh đậm cho nút bấm
-        SetTextColor(hdcButton, textColor);
-        return (LRESULT)hButtonBrush;
-    }
-    case WM_CLOSE: {
-        DestroyWindow(hwnd);
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
+        if (pDIS->CtlID == IDB_VPN_ON || pDIS->CtlID == IDB_VPN_OFF) {
+            // Define colors for 3D effect and button press state
+            COLORREF lightColor = RGB(102, 255, 102); // Lighter green
+            COLORREF darkColor = RGB(0, 51, 0);   // Darker green
+            COLORREF fillColor = RGB(0, 100, 0);  // Base green color
+            if (buttonPressed && pDIS->itemState & ODS_SELECTED) {
+                fillColor = darkColor; // Darken button color
+            }
+
+            // Draw Background
+            HBRUSH hBrush = CreateSolidBrush(fillColor);
+            FillRect(pDIS->hDC, &pDIS->rcItem, hBrush);
+            DeleteObject(hBrush);
+
+            // Draw the borders
+            HPEN hPen, hOldPen;
+            if (buttonPressed && pDIS->itemState & ODS_SELECTED)
+                hPen = CreatePen(PS_SOLID, 1, lightColor);
+            else
+                hPen = CreatePen(PS_SOLID, 1, darkColor);
+            hOldPen = (HPEN)SelectObject(pDIS->hDC, hPen);
+
+            HBRUSH hbrOld = (HBRUSH)SelectObject(pDIS->hDC, GetStockObject(NULL_BRUSH));
+            Rectangle(pDIS->hDC, pDIS->rcItem.left, pDIS->rcItem.top, pDIS->rcItem.right - 1, pDIS->rcItem.bottom - 1);
+            SelectObject(pDIS->hDC, hOldPen);
+            SelectObject(pDIS->hDC, hbrOld);
+
+            DeleteObject(hPen);
+
+            SetBkMode(pDIS->hDC, TRANSPARENT);
+            SetTextColor(pDIS->hDC, RGB(255, 255, 255)); // White text
+            SelectObject(pDIS->hDC, hFont); // Use global font
+
+            // Get the button text
+            int len = GetWindowTextLengthW(pDIS->hwndItem);
+            wchar_t* buffer = new wchar_t[len + 1];
+            GetWindowTextW(pDIS->hwndItem, buffer, len + 1);
+
+            DrawTextW(pDIS->hDC, buffer, -1, &pDIS->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            delete[] buffer;
+            return TRUE;
+        }
         break;
     }
-    case WM_DESTROY: {
-        if (hFont) {
-            DeleteObject(hFont);
-        }
-        if (hButtonBrush) {
-            DeleteObject(hButtonBrush);
-        }
-        if (hStaticTextBrush) {
-            DeleteObject(hStaticTextBrush);
-        }
-        if (hStaticTextBackgroundBrush) {
-            DeleteObject(hStaticTextBackgroundBrush);
-        }
-        PostQuitMessage(0);
+    case WM_PAINT:
+    {
+        hdc = BeginPaint(hWnd, &ps);
+        GetClientRect(hWnd, &rect);
+
+        // Background
+        hBrush = CreateSolidBrush(bgColor); // Use theme background color
+        FillRect(hdc, &rect, hBrush);
+        DeleteObject(hBrush);
+
+        // Font and Text
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, textColor); // Use theme text color
+        SelectObject(hdc, hFont);
+
+        // First Line with Top Margin
+        rect.top = 50;
+        DrawTextW(hdc, L"Phần mềm Socks - VPN", -1, &rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        rect.top += 25;
+        DrawTextW(hdc, L"Domain: ditucogivui.com", -1, &rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        rect.top += 25;
+        DrawTextW(hdc, L"IP: 103.82.24.7", -1, &rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        rect.top += 25;
+        DrawTextW(hdc, L"Email: luvideez@outlook.com", -1, &rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        rect.top += 25;
+        DrawTextW(hdc, L"Mobile: 0987575432", -1, &rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        rect.top += 25;
+        DrawTextW(hdc, bvSshStatus.c_str(), -1, &rect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+
+        EndPaint(hWnd, &ps);
         break;
     }
     default:
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
+        return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
 }
 
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR    lpCmdLine,
-    _In_ int       nCmdShow)
-{
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
+// Hàm hiển thị dialog About
+void ShowAboutDialog(HWND hWnd) {
+    MessageBoxW(hWnd, L"Socks by Luvideez\nServer: ditucogivui.com", L"Thông tin", MB_OK | MB_ICONINFORMATION);
+}
 
-    if (!InitInstance(hInstance)) {
-        return FALSE;
+// Hàm chọn file .tlp
+void ChooseTlpFile() {
+    OPENFILENAMEW ofn;
+    wchar_t szFile[260];
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hMainWnd;
+    ofn.lpstrFile = szFile;
+    ofn.lpstrFile[0] = L'\0';
+    ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
+    ofn.lpstrFilter = L"TLP Files (*.tlp)\0*.tlp\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrTitle = L"Chọn file .tlp"; // Vietnamese
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileNameW(&ofn) == TRUE) {
+        MessageBoxW(hMainWnd, L"Đã chọn file. Bạn có thể muốn lưu nó.", L"Thông tin", MB_OK | MB_ICONINFORMATION);
     }
-
-    ShowWindow(hwndMainWindow, nCmdShow);
-    UpdateWindow(hwndMainWindow);
-
-    MSG msg = {};
-    while (GetMessageW(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    return 0;
 }
